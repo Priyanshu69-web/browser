@@ -1,0 +1,35 @@
+{
+  "name": "browser-profile-manager",
+  "version": "1.0.0",
+  "description": "A desktop application for managing isolated Chromium browser profiles for development, testing, and QA workflows.",
+  "main": "./out/main/index.js",
+  "author": "Browser Profile Manager",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview"
+  },
+  "dependencies": {
+    "framer-motion": "^12.43.0",
+    "lucide-react": "^1.28.0",
+    "playwright": "^1.50.0",
+    "playwright-core": "^1.50.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@electron-toolkit/preload": "^3.0.0",
+    "@electron-toolkit/utils": "^4.0.0",
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/uuid": "^10.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "electron": "^34.0.0",
+    "electron-vite": "^3.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.7.0"
+  }
+}

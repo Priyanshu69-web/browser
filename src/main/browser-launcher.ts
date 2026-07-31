@@ -24,58 +24,19 @@ export function getOrbitaPath(): string | undefined {
 }
 
 /**
- * Attach CDP-level proxy authentication to a page (for HTTP proxies).
- */
-async function attachProxyAuth(page: Page, username: string, password: string): Promise<void> {
-  let cdp: CDPSession | null = null
-  try {
-    cdp = await page.context().newCDPSession(page)
-
-    await cdp.send('Fetch.enable', {
-      handleAuthRequests: true,
-      patterns: [{ urlPattern: '*' }]
-    })
-
-    cdp.on('Fetch.authRequired', async (event: Record<string, unknown>) => {
-      try {
-        await cdp!.send('Fetch.continueWithAuth', {
-          requestId: event.requestId,
-          authChallengeResponse: {
-            response: 'ProvideCredentials',
-            username,
-            password
-          }
-        })
-      } catch {
-        // Ignore
-      }
-    })
-
-    cdp.on('Fetch.requestPaused', async (event: Record<string, unknown>) => {
-      try {
-        await cdp!.send('Fetch.continueRequest', {
-          requestId: event.requestId
-        })
-      } catch {
-        // Ignore
-      }
-    })
-  } catch {
-    // Ignore
-  }
-}
-
-/**
  * Launch a browser profile using Playwright Anti-Detect Engine or custom browser executable.
  */
 export async function launchProfile(profileId: string): Promise<{ success: boolean; error?: string }> {
   try {
+    addLog('info', `[LOG] Initiating launch for profile ID: ${profileId}`)
     if (runningBrowsers.has(profileId) || runningProcesses.has(profileId)) {
+      addLog('error', `[LOG] Profile ${profileId} is already running.`)
       return { success: false, error: 'Profile is already running' }
     }
 
     const profile = getProfile(profileId)
     if (!profile) {
+      addLog('error', `[LOG] Profile ${profileId} not found in database.`)
       return { success: false, error: 'Profile not found' }
     }
 
@@ -89,11 +50,13 @@ export async function launchProfile(profileId: string): Promise<{ success: boole
     const proxyPassword = decryptString(profile.proxy_password_encrypted) || profile.proxy_password || ''
     const homepage = profile.homepage || getSetting('default_homepage') || 'https://www.google.com'
 
+    addLog('info', `[LOG] Profile "${profile.name}" loaded. User Data Dir: ${userDataDir}, Homepage: ${homepage}`)
+
     // ── Check if Custom Executable is defined ─────────────────────────────
     const customExecutablePath = getOrbitaPath()
 
     if (customExecutablePath) {
-      addLog('browser_launched', `Launching Custom Browser (${customExecutablePath}) for "${profile.name}"`, profileId)
+      addLog('browser_launched', `[LOG] Launching Custom Browser (${customExecutablePath}) for "${profile.name}"`, profileId)
 
       const args: string[] = [
         `--user-data-dir=${userDataDir}`,
@@ -129,22 +92,13 @@ export async function launchProfile(profileId: string): Promise<{ success: boole
       child.on('exit', (code) => {
         runningProcesses.delete(profileId)
         updateProfile(profileId, { status: 'ready' })
-        addLog('browser_closed', `Custom browser closed for "${profile.name}" (exit code: ${code})`, profileId)
+        addLog('browser_closed', `[LOG] Custom browser closed for "${profile.name}" (exit code: ${code})`, profileId)
       })
 
       return { success: true }
     }
 
-    // ── Playwright Anti-Detect Engine ───────────────────────────────────────
-    //
-    // Key design principles:
-    // 1. Do NOT override things Chromium already does correctly (plugins, webdriver)
-    // 2. Use CDP Network.setUserAgentOverride for Client Hints brand injection
-    // 3. Block WebRTC IP leaks via Chromium flags
-    // 4. Match real Chromium version in UA to avoid version mismatches
-    //
-
-    // The actual Playwright Chromium version — must match to avoid UA↔ClientHints↔Features mismatch
+    // ── Playwright Engine ───────────────────────────────────────────────────
     const chromiumVersion = '151.0.0.0'
     const chromiumFullVersion = '151.0.7922.34'
     const spoofedUserAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromiumVersion} Safari/537.36`
@@ -160,31 +114,29 @@ export async function launchProfile(profileId: string): Promise<{ success: boole
       '--disable-features=IsolateOrigins,site-per-process',
       '--lang=en-US,en',
       `--window-size=${profile.window_width || 1280},${profile.window_height || 800}`,
-      // ── WebRTC IP Leak Prevention ──
-      // Forces all WebRTC ICE candidates to go through the proxy, preventing real IP exposure
       '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
       '--webrtc-ip-handling-policy=disable_non_proxied_udp',
       '--enforce-webrtc-ip-permission-check'
     ]
 
-    let isHttpProxy = false
     let proxyConfig: { server: string; username?: string; password?: string; bypass?: string } | undefined
 
     if (profile.proxy_host && profile.proxy_host.trim() !== '') {
       const rawProxyType = (profile.proxy_type || 'http').toLowerCase()
       const port = profile.proxy_port || 80
 
-      const validation = await validateProxy(rawProxyType, profile.proxy_host, port, proxyUsername, proxyPassword, 8000)
+      const validation = await validateProxy(rawProxyType, profile.proxy_host, port, proxyUsername, proxyPassword, 5000)
       if (validation.success) {
-        addLog('proxy_success', `Proxy OK (${validation.latencyMs}ms): ${validation.details || 'tunnel open'}`, profileId)
+        addLog('proxy_success', `[LOG] Proxy OK (${validation.latencyMs}ms): ${validation.details || 'tunnel open'}`, profileId)
       } else {
-        addLog('proxy_failure', `Pre-flight warning: ${validation.error}`, profileId)
+        addLog('proxy_failure', `[LOG] Pre-flight proxy failure: ${validation.error}`, profileId)
+        return {
+          success: false,
+          error: `Proxy Connection Failed: ${validation.error}. Please update or disable the proxy for "${profile.name}".`
+        }
       }
 
       const scheme = rawProxyType.includes('socks') ? (rawProxyType.includes('socks4') ? 'socks4' : 'socks5') : 'http'
-      if (!rawProxyType.includes('socks')) {
-        isHttpProxy = true
-      }
 
       proxyConfig = {
         server: `${scheme}://${profile.proxy_host}:${port}`,
@@ -192,6 +144,7 @@ export async function launchProfile(profileId: string): Promise<{ success: boole
       }
       if (proxyUsername) proxyConfig.username = proxyUsername
       if (proxyPassword) proxyConfig.password = proxyPassword
+      addLog('info', `[LOG] Proxy configured: ${proxyConfig.server} (User: ${proxyUsername ? 'yes' : 'no'})`, profileId)
     }
 
     const launchOptions: Record<string, unknown> = {
@@ -204,7 +157,6 @@ export async function launchProfile(profileId: string): Promise<{ success: boole
       locale: profile.language || 'en-US',
       timezoneId: profile.timezone || 'America/New_York',
       ignoreHTTPSErrors: true,
-      // Removing --enable-automation makes navigator.webdriver=false natively (no JS hack needed)
       ignoreDefaultArgs: ['--enable-automation'],
       args
     }
@@ -213,129 +165,31 @@ export async function launchProfile(profileId: string): Promise<{ success: boole
       launchOptions.proxy = proxyConfig
     }
 
-    addLog('browser_launched', `Launching Anti-Detect Engine for "${profile.name}"`, profileId)
+    addLog('browser_launched', `[LOG] Launching Playwright Context for "${profile.name}"`, profileId)
 
     const context = await chromium.launchPersistentContext(userDataDir, launchOptions)
+    addLog('info', `[LOG] Persistent Context created successfully for "${profile.name}"`, profileId)
 
-    // ── CDP: Inject Client Hints brands ("Google Chrome") ──────────────────
-    // Playwright's Chromium is unbranded — it sends "Chromium" only.
-    // Real Chrome sends "Google Chrome" + "Chromium" + greased brand.
-    // We use Network.setUserAgentOverride with userAgentMetadata to fix this.
-    // This also removes Pragma/Cache-Control headers that Playwright injects.
-    async function applyAntiDetectCDP(page: Page): Promise<void> {
-      let cdp: CDPSession | null = null
-      try {
-        cdp = await page.context().newCDPSession(page)
-
-        // Inject "Google Chrome" brand into Client Hints (Issue #3, #10, #22)
-        await cdp.send('Network.setUserAgentOverride', {
-          userAgent: spoofedUserAgent,
-          acceptLanguage: 'en-US,en;q=0.9',
-          platform: 'Win32',
-          userAgentMetadata: {
-            brands: [
-              { brand: 'Google Chrome', version: '151' },
-              { brand: 'Chromium', version: '151' },
-              { brand: 'Not)A;Brand', version: '24' }
-            ],
-            fullVersionList: [
-              { brand: 'Google Chrome', version: chromiumFullVersion },
-              { brand: 'Chromium', version: chromiumFullVersion },
-              { brand: 'Not)A;Brand', version: '24.0.0.0' }
-            ],
-            fullVersion: chromiumFullVersion,
-            platform: 'Windows',
-            platformVersion: '10.0.0',
-            architecture: 'x86',
-            model: '',
-            mobile: false,
-            bitness: '64',
-            wow64: false
-          }
-        })
-
-        // Remove Pragma/Cache-Control headers that Playwright injects (Issue #7)
-        await cdp.send('Network.setExtraHTTPHeaders', {
-          headers: {
-            'Pragma': '',
-            'Cache-Control': ''
-          }
-        })
-      } catch {
-        // Non-fatal: CDP session may fail on some pages
-      }
+    // Setup logging for page events
+    function setupPageLogging(page: Page, label: string) {
+      page.on('framenavigated', (frame) => {
+        if (frame === page.mainFrame()) {
+          addLog('info', `[LOG] Page (${label}) MainFrame Navigated to: ${frame.url()}`, profileId)
+        }
+      })
+      page.on('request', (req) => {
+        addLog('info', `[LOG] Page (${label}) Request Start: ${req.method()} ${req.url()}`, profileId)
+      })
+      page.on('response', (res) => {
+        addLog('info', `[LOG] Page (${label}) Response: ${res.status()} ${res.url()}`, profileId)
+      })
+      page.on('requestfailed', (req) => {
+        addLog('error', `[LOG] Page (${label}) Request Failed: ${req.url()} (${req.failure()?.errorText || 'Unknown'})`, profileId)
+      })
+      page.on('pageerror', (err) => {
+        addLog('error', `[LOG] Page (${label}) Unhandled Exception: ${err.message}`, profileId)
+      })
     }
-
-    // Minimal init script — only override what Chromium gets WRONG, not what it gets right.
-    // Native Chromium already provides:
-    //   - navigator.webdriver = false (when --enable-automation is removed)
-    //   - navigator.plugins = 5 correct PDF plugins
-    //   - navigator.vendor = "Google Inc."
-    //   - navigator.languages = ["en-US", "en"]
-    await context.addInitScript(() => {
-      // Clean up CDP/automation detection artifacts
-      try {
-        const cleanProps = ['cdc_adoQpoasnfa76pfcZLmcfl_Array', 'cdc_adoQpoasnfa76pfcZLmcfl_Promise', 'cdc_adoQpoasnfa76pfcZLmcfl_Symbol', '$cdc_asdjflasutdfhxcv_']
-        cleanProps.forEach((prop) => {
-          delete (window as any)[prop]
-          delete (document as any)[prop]
-        })
-      } catch {}
-
-      // hardwareConcurrency: GoLogin reports 4, our system leaks 8 (Issue #5)
-      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 })
-
-      // deviceMemory: Playwright Chromium strips this property, GoLogin reports 8
-      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 })
-
-      // Ensure window.chrome object exists with proper structure
-      if (!(window as any).chrome) {
-        ;(window as any).chrome = {}
-      }
-      const c = (window as any).chrome
-      c.app = c.app || {
-        isInstalled: false,
-        InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
-        RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
-      }
-      c.csi = c.csi || function () { return { startE: Date.now(), onloadT: Date.now() + 100, pageT: 50, tran: 15 } }
-      c.loadTimes = c.loadTimes || function () {
-        return {
-          requestTime: Date.now() / 1000 - 0.5,
-          startLoadTime: Date.now() / 1000 - 0.4,
-          commitLoadTime: Date.now() / 1000 - 0.2,
-          finishDocumentLoadTime: Date.now() / 1000 - 0.1,
-          finishLoadTime: Date.now() / 1000,
-          firstPaintTime: Date.now() / 1000 - 0.2,
-          firstPaintAfterLoadTime: 0,
-          navigationType: 'Other',
-          wasFetchedViaSpdy: true,
-          wasNpnNegotiated: true,
-          npnNegotiatedProtocol: 'h2',
-          wasAlternateProtocolAvailable: false,
-          connectionInfo: 'h2'
-        }
-      }
-      c.runtime = c.runtime || {
-        OnInstalledReason: { INSTALL: 'install', UPDATE: 'update' },
-        OnRestartRequiredReason: { APP_UPDATE: 'app_update' },
-        PlatformArch: { ARM: 'arm', X86_64: 'x86_64' },
-        PlatformOs: { WIN: 'win', MAC: 'mac', CROS: 'cros', LINUX: 'linux' },
-        connect: function () {},
-        sendMessage: function () {}
-      }
-
-      // Permissions API: return consistent results for notifications
-      try {
-        const originalQuery = window.Permissions.prototype.query
-        ;(window.Permissions.prototype as any).query = function (parameters: any) {
-          if (parameters && parameters.name === 'notifications') {
-            return Promise.resolve({ state: Notification.permission || 'granted', onchange: null })
-          }
-          return originalQuery.apply(this, arguments as any)
-        }
-      } catch {}
-    })
 
     runningBrowsers.set(profileId, context)
 
@@ -344,48 +198,44 @@ export async function launchProfile(profileId: string): Promise<{ success: boole
       last_launched: new Date().toISOString()
     })
 
-    // Apply CDP anti-detect + proxy auth to all existing and new pages
     for (const existingPage of context.pages()) {
-      await applyAntiDetectCDP(existingPage)
-      if (isHttpProxy && proxyUsername) {
-        await attachProxyAuth(existingPage, proxyUsername, proxyPassword)
-      }
+      setupPageLogging(existingPage, 'existing')
     }
 
-    context.on('page', async (newPage: Page) => {
-      await applyAntiDetectCDP(newPage)
-      if (isHttpProxy && proxyUsername) {
-        await attachProxyAuth(newPage, proxyUsername, proxyPassword)
-      }
+    context.on('page', (newPage: Page) => {
+      addLog('info', `[LOG] New tab/page created in context`, profileId)
+      setupPageLogging(newPage, 'new-tab')
     })
 
     const pages = context.pages()
     const mainPage = pages.length > 0 ? pages[0] : await context.newPage()
 
     if (pages.length === 0) {
-      await applyAntiDetectCDP(mainPage)
-      if (isHttpProxy && proxyUsername) {
-        await attachProxyAuth(mainPage, proxyUsername, proxyPassword)
-      }
+      setupPageLogging(mainPage, 'main')
     }
 
+    addLog('info', `[LOG] Navigating main page to homepage: ${homepage}`, profileId)
+
     mainPage.goto(homepage, { timeout: 35000, waitUntil: 'domcontentloaded' })
-      .then(() => addLog('info', `Loaded: ${homepage}`, profileId))
+      .then((response) => {
+        const status = response ? response.status() : 'OK'
+        addLog('info', `[LOG] Navigation finished for ${homepage} (Status: ${status})`, profileId)
+      })
       .catch((err) => {
         const msg = err instanceof Error ? err.message : String(err)
-        addLog('error', `Navigation note: ${msg}`, profileId)
+        addLog('error', `[LOG] Navigation error for ${homepage}: ${msg}`, profileId)
       })
 
     context.on('close', () => {
       runningBrowsers.delete(profileId)
       updateProfile(profileId, { status: 'ready' })
-      addLog('browser_closed', `Browser closed for "${profile.name}"`, profileId)
+      addLog('browser_closed', `[LOG] Browser closed for "${profile.name}"`, profileId)
     })
 
     return { success: true }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error)
-    addLog('error', `Launch failed: ${errorMessage}`, profileId)
+    addLog('error', `[LOG] Launch failed: ${errorMessage}`, profileId)
     updateProfile(profileId, { status: 'error' })
     return { success: false, error: errorMessage }
   }
